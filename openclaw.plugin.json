@@ -1,11 +1,11 @@
 {
-    "id": "rocketchat",
+    "id": "rocketchat-webhook",
     "name": "RocketChat Webhook",
     "version": "0.1.0",
     "description": "Rocket.Chat integration for OpenClaw",
     "type": "channel",
     "channels": [
-        "rocketchat"
+        "rocketchat-webhook"
     ],
     "configSchema": {
         "RC_URL": {
