@@ -174,21 +174,6 @@ export type ChannelRuleOptions = {
   mentionNames: string[];
 };
 
-export type CheckpointState = {
-  updatedSince: string | null;
-  recentMessageIds: string[];
-  failedMessages?: FailedMessageRecord[];
-};
-
-export type FailedMessageRecord = {
-  messageId: string;
-  roomId: string;
-  senderName: string;
-  sentAt: string;
-  failedAt: string;
-  reason: string;
-};
-
 export type GatewayApi = {
   registerGatewayMethod(name: string, handler: (ctx: unknown) => Promise<void>): void;
   registerChannel?(args: { plugin: unknown }): void;

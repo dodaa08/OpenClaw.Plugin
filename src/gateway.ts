@@ -1,7 +1,10 @@
+import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
+import type { PersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
+import { readJsonFileWithFallback, writeJsonFileAtomically } from "openclaw/plugin-sdk/json-store";
+
 import { resolveOpenClawDir } from "./utils.js";
 import { RocketChatClient, RocketChatRateLimitError } from "./client.js";
 import { parsePluginConfig } from "./config.js";
-import { FileCheckpointStore } from "./checkpoint-store.js";
 import { getMessageAttachmentInputs, normalizeInboundAttachments } from "./attachments.js";
 import type { InboundEvent } from "./types/types.js";
 import { shouldHandleInboundEvent } from "./channel.js";
@@ -76,38 +79,47 @@ class PollState {
   }
 }
 
+async function readUpdatedSince(filePath: string): Promise<string | null> {
+  const { value } = await readJsonFileWithFallback<{ updatedSince?: string }>(filePath, {});
+  return value.updatedSince ?? null;
+}
+
+async function writeUpdatedSince(filePath: string, updatedSince: string): Promise<void> {
+  await writeJsonFileAtomically(filePath, { updatedSince });
+}
+
 async function pollOnce(
   client: RocketChatClient,
-  checkpoint: FileCheckpointStore,
+  dedupe: PersistentDedupe,
+  updatedSincePath: string,
   identity: RocketChatIdentity,
   mentionNames: string[],
   ctx: GatewayContext,
   account: ResolvedAccount,
   state: PollState,
 ): Promise<void> {
-  const stateData = await checkpoint.read();
-  if (!stateData.updatedSince) {
-    const lookback = new Date(Date.now() - 300_000).toISOString();
-    await checkpoint.write({ updatedSince: lookback, recentMessageIds: stateData.recentMessageIds });
-    stateData.updatedSince = lookback;
+  let updatedSince = await readUpdatedSince(updatedSincePath);
+  if (!updatedSince) {
+    updatedSince = new Date(Date.now() - 300_000).toISOString();
+    await writeUpdatedSince(updatedSincePath, updatedSince);
   }
 
-  const seenIds = new Set(stateData.recentMessageIds);
-  const subscriptions = await client.listSubscriptions(stateData.updatedSince);
-  let nextUpdatedSince = stateData.updatedSince;
+  const subscriptions = await client.listSubscriptions(updatedSince);
+  let nextUpdatedSince = updatedSince;
   let foundMessages = false;
 
   for (const sub of subscriptions) {
     const subTs = sub._updatedAt ?? sub.updatedAt ?? null;
     if (subTs && subTs > nextUpdatedSince) nextUpdatedSince = subTs;
 
-    const messages = await client.syncMessages(sub.rid, stateData.updatedSince);
+    const messages = await client.syncMessages(sub.rid, updatedSince);
     messages.sort((a, b) => (a.ts ?? a._updatedAt ?? "").localeCompare(b.ts ?? b._updatedAt ?? ""));
     for (const msg of messages) {
       const msgTs = msg.ts ?? msg._updatedAt ?? null;
       if (msgTs && msgTs > nextUpdatedSince) nextUpdatedSince = msgTs;
 
-      if (shouldSkipMessage(msg, identity.userId, seenIds)) continue;
+      if (shouldSkipMessage(msg, identity.userId)) continue;
+      if (!(await dedupe.checkAndRecord(msg._id))) continue;
 
       const event = toInboundEvent(account.accountId, sub, msg, account.serverUrl);
 
@@ -117,12 +129,7 @@ async function pollOnce(
 
       logger.info(`[rocketchat:${account.accountId}] inbound from ${event.senderName}: "${event.text.slice(0, 80)}"`);
 
-      seenIds.add(msg._id);
-      await checkpoint.write({
-        updatedSince: nextUpdatedSince,
-        recentMessageIds: [...seenIds].slice(-250),
-        failedMessages: stateData.failedMessages ?? [],
-      });
+      await writeUpdatedSince(updatedSincePath, nextUpdatedSince);
 
       if (ctx.channelRuntime) {
         try {
@@ -130,14 +137,6 @@ async function pollOnce(
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);
           logger.error(`[rocketchat:${account.accountId}] failed to handle message ${event.messageId}: ${reason}`);
-          await checkpoint.recordFailure({
-            messageId: event.messageId,
-            roomId: event.roomId,
-            senderName: event.senderName,
-            sentAt: event.sentAt,
-            failedAt: new Date().toISOString(),
-            reason,
-          });
         }
       } else if (!state.warnedAboutMissingRuntime) {
         state.warnedAboutMissingRuntime = true;
@@ -226,8 +225,14 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   logger.info(`[rocketchat:${account.accountId}] connected as ${identity.username}`);
 
   const stateDir = resolveOpenClawDir();
-  const checkpointPath = `${stateDir}/rocketchat/${account.accountId}.json`;
-  const checkpoint = new FileCheckpointStore(checkpointPath, 250);
+  const rocketchatDir = `${stateDir}/rocketchat`;
+  const dedupe = createPersistentDedupe({
+    ttlMs: 10 * 60 * 1000,
+    memoryMaxSize: 1000,
+    fileMaxEntries: 500,
+    resolveFilePath: (ns) => `${rocketchatDir}/${ns}.dedupe.json`,
+  });
+  const updatedSincePath = `${rocketchatDir}/${account.accountId}.since.json`;
   const state = new PollState();
   const mentionNames = dedupeMentions([identity.username, ...account.mentionNames]);
 
@@ -239,7 +244,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     }
 
     try {
-      await pollOnce(client, checkpoint, identity, mentionNames, ctx, account, state);
+      await pollOnce(client, dedupe, updatedSincePath, identity, mentionNames, ctx, account, state);
     } catch (err) {
       if (err instanceof RocketChatRateLimitError) {
         state.block(err.retryAfterMs);
@@ -301,13 +306,11 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 function shouldSkipMessage(
   msg: import("./types/types.js").RocketChatMessageRecord,
   botUserId: string,
-  seenIds: Set<string>,
 ): boolean {
   if (!msg._id) return true;
   if (msg.t) return true;
   if ((!msg.msg || msg.msg.trim().length === 0) && getMessageAttachmentInputs(msg).length === 0) return true;
   if (msg.u?._id === botUserId) return true;
-  if (seenIds.has(msg._id)) return true;
   return false;
 }
 

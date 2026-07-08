@@ -1,11 +1,13 @@
-import { mkdir, writeFile, readFile } from "node:fs/promises";
-import { join, basename } from "node:path";
-import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
 
-import { resolveOpenClawDir, resolveUrl, getExt, getErrorMessage } from "./utils.js";
+import { ssrfPolicyFromHttpBaseUrlAllowedHostname } from "openclaw/plugin-sdk/ssrf-runtime";
+import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
+import { loadWebMedia } from "openclaw/plugin-sdk/web-media";
+
+import { getErrorMessage } from "./utils.js";
 
 const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
-const ALLOWED_DOWNLOAD_MIME_PREFIXES = ["image/"];
 
 import type {
   PluginAccountConfig,
@@ -37,7 +39,6 @@ export class RocketChatClient {
   private readonly serverUrl: string;
   private readonly auth: PluginAccountConfig["auth"];
   private readonly fetchFn: typeof fetch;
-  private readonly mediaDir: string;
   private identity: RocketChatIdentity | null = null;
   private resolvedUserId: string | null = null;
   private resolvedAuthToken: string | null = null;
@@ -46,7 +47,6 @@ export class RocketChatClient {
     this.serverUrl = options.serverUrl.replace(/\/+$/, "");
     this.auth = options.auth;
     this.fetchFn = options.fetch ?? globalThis.fetch;
-    this.mediaDir = join(resolveOpenClawDir(), "media");
 
     if (this.auth.mode === "token") {
       this.resolvedUserId = this.auth.userId;
@@ -140,50 +140,31 @@ export class RocketChatClient {
     options?: { fileName?: string },
   ): Promise<string> {
     await this.ensureInitialized();
-    const requestUrl = resolveUrl(url, this.serverUrl);
-    if (isBlockedUrl(requestUrl, this.serverUrl)) {
-      throw new RocketChatClientError(`attachment download blocked: ${requestUrl} resolves to a private/internal address`);
-    }
-    const response = await this.fetchFn(requestUrl, {
-      method: "GET",
-      headers: {
-        Accept: "*/*",
-        "X-User-Id": this.resolvedUserId!,
-        "X-Auth-Token": this.resolvedAuthToken!,
+    const ssrfPolicy = ssrfPolicyFromHttpBaseUrlAllowedHostname(this.serverUrl);
+    const result = await loadWebMedia(url, {
+      maxBytes: MAX_DOWNLOAD_BYTES,
+      ...(ssrfPolicy ? { ssrfPolicy } : {}),
+      fetchImpl: this.fetchFn,
+      requestInit: {
+        headers: {
+          "X-User-Id": this.resolvedUserId!,
+          "X-Auth-Token": this.resolvedAuthToken!,
+        },
       },
     });
-    if (!response.ok) {
-      throw new RocketChatClientError(`attachment download failed: ${response.statusText}`);
-    }
-    const contentTypeHeader = response.headers.get("Content-Type");
-    const rawContentType = (contentTypeHeader ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
-    if (!rawContentType || !ALLOWED_DOWNLOAD_MIME_PREFIXES.some((p) => rawContentType.startsWith(p))) {
+    if (!result.kind) {
       throw new RocketChatClientError(
-        `attachment download refused: unsupported content type "${contentTypeHeader ?? ""}"`,
+        `attachment download refused: unsupported content type "${result.contentType ?? "unknown"}"`,
       );
     }
-    const contentLength = response.headers.get("Content-Length");
-    if (contentLength) {
-      const bytes = Number.parseInt(contentLength, 10);
-      if (!Number.isNaN(bytes) && bytes > MAX_DOWNLOAD_BYTES) {
-        throw new RocketChatClientError(
-          `attachment download refused: Content-Length ${bytes} exceeds max ${MAX_DOWNLOAD_BYTES}`,
-        );
-      }
-    }
-    const inboundDir = join(this.mediaDir, "inbound");
-    await mkdir(inboundDir, { recursive: true });
-    const ext = getExt(options?.fileName ?? url ?? "attachment");
-    const safeName = (options?.fileName ?? "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
-    const filePath = join(inboundDir, `${safeName}---${randomUUID().slice(0, 12)}${ext ? `.${ext}` : ""}`);
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (bytes.length > MAX_DOWNLOAD_BYTES) {
-      throw new RocketChatClientError(
-        `attachment download refused: actual size ${bytes.length} exceeds max ${MAX_DOWNLOAD_BYTES}`,
-      );
-    }
-    await writeFile(filePath, bytes);
-    return filePath;
+    const saved = await saveMediaBuffer(
+      result.buffer,
+      result.contentType,
+      "inbound",
+      MAX_DOWNLOAD_BYTES,
+      options?.fileName,
+    );
+    return saved.path;
   }
 
   async uploadAttachment(
@@ -287,34 +268,6 @@ export class RocketChatClient {
     }
 
     return payload;
-  }
-}
-
-function isBlockedUrl(url: string, allowedOrigin?: string): boolean {
-  try {
-    const parsedUrl = new URL(url);
-    const hostname = parsedUrl.hostname.toLowerCase();
-    const allowed = allowedOrigin ? new URL(allowedOrigin) : undefined;
-    if (allowed && parsedUrl.origin === allowed.origin) {
-      return false;
-    }
-    if (
-      hostname === "localhost" ||
-      hostname === "127.0.0.1" ||
-      hostname === "::1" ||
-      hostname === "0.0.0.0" ||
-      hostname.endsWith(".local") ||
-      hostname.endsWith(".internal") ||
-      hostname.startsWith("10.") ||
-      hostname.startsWith("192.168.") ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
-      /^169\.254\./.test(hostname)
-    ) {
-      return true;
-    }
-    return false;
-  } catch {
-    return false;
   }
 }
 
