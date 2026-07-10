@@ -1,6 +1,7 @@
 import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
 import type { PersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
 import { readJsonFileWithFallback, writeJsonFileAtomically } from "openclaw/plugin-sdk/json-store";
+import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime";
 
 import { resolveOpenClawDir } from "./utils.js";
 import { RocketChatClient, RocketChatRateLimitError } from "./client.js";
@@ -26,10 +27,7 @@ export type ClientEntry = { client: RocketChatClient; generation: number; wakeup
 export const activeClients = new Map<string, ClientEntry>();
 let nextGeneration = 0;
 
-let logger: { info: (msg: string) => void; error: (msg: string) => void } = {
-  info: (msg: string) => console.log(`[RC] ${msg}`),
-  error: (msg: string) => console.error(`[RC] ${msg}`),
-};
+const logger = createSubsystemLogger("rocketchat-gateway");
 
 export function resolveAccount(cfg: unknown, accountId?: string): ResolvedAccount | null {
   const config = parseChannelConfig(cfg as OpenClawConfig);
