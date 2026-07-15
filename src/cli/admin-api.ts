@@ -44,6 +44,15 @@ async function adminFetch(baseUrl: string, path: string, opts: RCFetchOpts = {})
   return json;
 }
 
+export async function isServerReachable(baseUrl: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/api/v1/version`, { method: "GET" });
+    return res.status < 600;
+  } catch {
+    return false;
+  }
+}
+
 export async function loginAs(baseUrl: string, user: string, password: string): Promise<RCLoginResult> {
   const json = await adminFetch(baseUrl, "/api/v1/login", { body: { user, password } });
   const data = extractRecord(json, "data");
