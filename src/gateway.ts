@@ -18,6 +18,7 @@ import type {
   RocketChatIdentity,
   OutboundReplyPayload,
   ReplyDeliverInfo,
+  FailedMessageRecord,
 } from "./types/types.js";
 
 const MAX_MESSAGE_LENGTH = 10_000;
@@ -86,10 +87,23 @@ async function writeUpdatedSince(filePath: string, updatedSince: string): Promis
   await writeJsonFileAtomically(filePath, { updatedSince });
 }
 
+const FAILURE_LIMIT = 100;
+
+async function recordFailure(failuresPath: string, failure: FailedMessageRecord): Promise<void> {
+  const { value } = await readJsonFileWithFallback<{ failures?: FailedMessageRecord[] }>(failuresPath, {});
+  const existing = Array.isArray(value.failures) ? value.failures : [];
+  const updated = [
+    ...existing.filter((f) => f.messageId !== failure.messageId),
+    failure,
+  ].slice(-FAILURE_LIMIT);
+  await writeJsonFileAtomically(failuresPath, { failures: updated });
+}
+
 async function pollOnce(
   client: RocketChatClient,
   dedupe: PersistentDedupe,
   updatedSincePath: string,
+  failuresPath: string,
   identity: RocketChatIdentity,
   mentionNames: string[],
   ctx: GatewayContext,
@@ -135,6 +149,14 @@ async function pollOnce(
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);
           logger.error(`[rocketchat:${account.accountId}] failed to handle message ${event.messageId}: ${reason}`);
+          await recordFailure(failuresPath, {
+            messageId: event.messageId,
+            roomId: event.roomId,
+            senderName: event.senderName,
+            sentAt: event.sentAt,
+            failedAt: new Date().toISOString(),
+            reason,
+          }).catch(() => {});
         }
       } else if (!state.warnedAboutMissingRuntime) {
         state.warnedAboutMissingRuntime = true;
@@ -231,6 +253,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     resolveFilePath: (ns) => `${rocketchatDir}/${ns}.dedupe.json`,
   });
   const updatedSincePath = `${rocketchatDir}/${account.accountId}.since.json`;
+  const failuresPath = `${rocketchatDir}/${account.accountId}.failures.json`;
   const state = new PollState();
   const mentionNames = dedupeMentions([identity.username, ...account.mentionNames]);
 
@@ -242,7 +265,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     }
 
     try {
-      await pollOnce(client, dedupe, updatedSincePath, identity, mentionNames, ctx, account, state);
+      await pollOnce(client, dedupe, updatedSincePath, failuresPath, identity, mentionNames, ctx, account, state);
     } catch (err) {
       if (err instanceof RocketChatRateLimitError) {
         state.block(err.retryAfterMs);

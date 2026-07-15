@@ -169,6 +169,15 @@ export type ChannelRuntimeLike = {
   };
 };
 
+export type FailedMessageRecord = {
+  messageId: string;
+  roomId: string;
+  senderName: string;
+  sentAt: string;
+  failedAt: string;
+  reason: string;
+};
+
 export type ChannelRuleOptions = {
   botUserId: string;
   mentionNames: string[];
