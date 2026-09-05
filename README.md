@@ -16,3 +16,5 @@ A fully unified plugin for integrating Rocket.Chat with OpenClaw. This plugin el
 - **Good UX and Reactions**: Rich chat interactions including native message reactions.
 - **Bot-to-Bot Delegation**: Support for delegating and automating tasks between different bots.
 - **Native Access Control**: Role enforcement and `allowFrom` policies are handled natively through OpenClaw.
+
+test change
